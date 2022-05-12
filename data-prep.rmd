@@ -1,0 +1,185 @@
+---
+title: "Data preparation"
+output:
+  pdf_document: default
+---
+
+# Instructions
+
+- You only need to submit the .Rmd of this file, not a PDF.
+
+- You should __comment__ your code clearly to show what you've done to prepare the data.
+
+- The purpose of this file is to use the data in the `data-raw` folder to create the data you will use in the report. The data you will use in the report should be saved in the `data` folder. It is good professional practice to make sure you're never directly modifying your raw data, but instead creating new datasets based on merges/manipulations that you need to reuse.
+
+- Make sure you've taken a look at the hints for the web scraping and census API. 
+
+- You may find the `write_rds()` function from the `readr` package helpful (it is loaded as part of the `tidyverse`).
+
+- You do not need to keep the structure below.
+
+
+### Set up
+
+```{r, libraries, warning=FALSE}
+# Set up any libraries you need
+#install.packages("readr")
+library(tidyverse)
+#install.packages("rio")
+library(rio)
+library(readr)
+#install.packages("plotly")
+library(plotly)
+#install.packages("cancensus")
+library(cancensus)
+#install.packages("sf")
+library(sf)
+#install.packages("lme4")
+library(Matrix)
+library(lme4)
+library(lubridate)
+library(polite)
+library(rvest)
+library(cancensus)
+library(geojsonsf)
+library(haven)
+```
+
+# Loading client data
+
+```{r}
+#load the client data by using read_rds
+cust_dev= read_rds("data-raw/cust_dev.Rds")
+cust_sleep= read_rds("data-raw/cust_sleep.Rds")
+customer= read_rds("data-raw/customer.Rds")
+device= read_rds("data-raw/device.Rds")
+
+```
+
+# Getting external data
+
+## Web scraping industry data
+
+```{r}
+
+url <- "https://fitnesstrackerinfohub.netlify.app/"
+# informative user_agent details
+target <- bow(url,
+              user_agent = "zhuoxuan.li@mail.utoronto.ca for STA303/1002 project",
+              force = TRUE)
+
+# Any details provided in the robots text on crawl delays and 
+# which agents are allowed to scrape
+target
+
+html <- scrape(target)
+
+device_data <- html %>% 
+  html_elements("table") %>% 
+  html_table() %>% 
+  pluck(1) # added, in case you're getting a list format
+
+device_data
+
+```
+
+# Census API
+
+```{r, warning=FALSE}
+
+options(cancensus.api_key = "CensusMapper_1d5d0119fb3de5d69383bcdba47e17fb",
+        cancensus.cache_path = "cache") 
+
+
+# get all regions information in 2016 Census
+regions <- list_census_regions(dataset = "CA16")
+
+regions_filtered <-  regions %>% 
+  filter(level == "CSD") %>% # Figure out what CSD means in Census data
+  as_census_region_list()
+
+# To get the median income for the regions
+census_data_csd <- get_census(dataset='CA16', regions = regions_filtered,
+                          vectors=c("v_CA16_2397"), 
+                          level='CSD', geo_format = "sf")
+
+# Save the variables we need
+median_income <- census_data_csd %>% as_tibble() %>% 
+  select(CSDuid = GeoUID, contains("median"), Population) %>% 
+  mutate(CSDuid = parse_number(CSDuid)) %>% 
+  rename(hhld_median_inc = 2)
+```
+
+```{r}
+# read the data for the postcode data
+dataset = read_sav("data-raw/pccfNat_fccpNat_082021sav.sav")
+
+postcode = dataset %>% select(PC, CSDuid) %>%
+  rename(c("postcode"= "PC")) %>% group_by(postcode, CSDuid)
+
+postcode
+```
+
+###Merge
+
+```{r}
+#Put two table together by using left join and group by postcode
+Postcode_med_income= postcode %>% distinct_all() %>% left_join(median_income) %>% group_by(postcode)
+
+Postcode_med_income%>% summarise(hhld_median_inc= mean(hhld_median_inc, na.rm= TRUE),
+            Population= sum(Population, na.rm= TRUE)) %>% ungroup()
+```
+
+```{r, warning=FALSE}
+#Put customer information, device information table together by using left join
+customer_dev_infor = customer %>%
+  left_join(cust_dev) %>% left_join(device) %>%
+  left_join(rename(device_data, c("device_name"= "Device name", "line"=  "Line", 
+                                  "Sleep_tracking"= "Sleep tracking", "Battery_life"= "Battery life"))) %>%
+  left_join(Postcode_med_income) %>% ungroup()
+
+customer_dev_infor
+
+
+customer_dev_infor %>%
+  distinct(device_name, released) %>%
+  arrange(desc(released))
+
+#Rename the required variables for the research questions
+customer_dev_infor1 <- customer_dev_infor %>%
+  mutate(age= time_length(interval(dob, released), "year"),Active_Advance = if_else(line %in% c("Active", "Advance"), "Active_Advance", "others")) %>%
+  mutate(age= round(age, 0)) %>%
+  mutate(skin_color= case_when(emoji_modifier=="U+1F3FB"~"Light skin",
+                           emoji_modifier=="U+1F3FC"~"Medium light skin",
+                           emoji_modifier=="U+1F3FD"~"Medium skin",
+                           emoji_modifier=="U+1F3FE"~"Medium dark skin",
+                           emoji_modifier=="U+1F3FF"~"Dark skin",
+                           is.na(emoji_modifier)~"others")) %>%
+  mutate_at("device_name", factor, levels = c("Run ON", "Advance 2", "Active Alpha", 
+            "Run BE", "Advance", "Active", "Active HR", "Run 875", "Run 875 X", "iDOL", "Run 7", "Run 7 Plus",
+            "Run HYYH", "Run Leader", "Run"))
+
+# Normalize the median income and population
+customer_dev_infor1$Median_Income<-
+  (customer_dev_infor1$hhld_median_inc-mean(customer_dev_infor1$hhld_median_inc))/sd(customer_dev_infor1$hhld_median_inc)
+
+customer_dev_infor1$Popu<-(customer_dev_infor1$Population-mean(customer_dev_infor1$Population))/sd(customer_dev_infor1$Population)
+# Reduced the unuseful variables
+customer_dev_infor1= customer_dev_infor1 %>% select(-dob, -pronouns, -released, -Brand, -emoji_modifier)
+
+#The table information we need to use in research question 1
+customer_dev_infor1
+write_rds(customer_dev_infor1,"data/customer_dev_infor1.Rds")
+
+```
+
+```{r}
+#join the tables
+customer_sleep_infor <- cust_sleep %>%
+  left_join(customer_dev_infor1)
+
+#The table information we need to use in research question 2
+customer_sleep_infor
+write_rds(customer_sleep_infor,"data/customer_sleep_infor.Rds")
+```
+
